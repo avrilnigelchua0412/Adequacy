@@ -1,0 +1,12 @@
+resize:
+  type: letterbox
+  size: 512
+  stride: 32
+  identity: true
+
+normalize:
+  enabled: true
+  method: scale
+  scale: 1/255
+
+color_space: RGB

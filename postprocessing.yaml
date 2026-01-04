@@ -1,0 +1,4 @@
+nms: true
+conf_threshold: 0.35
+iou_threshold: 0.45
+max_detections: 1000
