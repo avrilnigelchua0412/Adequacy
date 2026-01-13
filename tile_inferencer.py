@@ -1,7 +1,6 @@
 import onnxruntime as ort
 import numpy as np
 import json, yaml
-from PIL import Image
 
 class TileInferencer:
     def __init__(self, model_path, input_spec_path, preprocessing_path, provider="CPUExecutionProvider"):
@@ -20,9 +19,6 @@ class TileInferencer:
         self.input_h = self.input_spec["input_size"][2]
         self.input_w = self.input_spec["input_size"][3]
 
-    def get_img(self, tile_img_path):
-        tile_img = np.array(Image.open(tile_img_path))  # HWC, RGB
-        return tile_img
     
     def preprocess(self, tile_img):
             """

@@ -85,4 +85,3 @@ def iou_based_clustering(boxes, confidences):
     graph = build_iou_graph_batch(boxes)
     clusters = connected_components(graph)
     return cluster_features(boxes, confidences, clusters)
-
