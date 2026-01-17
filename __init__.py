@@ -1,4 +1,4 @@
-from utils import xywh_to_xyxy, draw_cluster, get_img
+from utils import xywh_to_xyxy, draw_cluster, get_img, helper_os_walk, weighted_boxes_fusion_helper, get_thyrocytes_inside_cluster
 from IoU_adjacency_matrix import iou_based_clustering
 from tile_inferencer import TileInferencer
 import onnxruntime as ort
@@ -28,6 +28,8 @@ Intended use:
 """
 
 if __name__ == "__main__":
+    data_path = "Data"
+    
     # model_path = "YOLOv5 Nano Level 3 Model/best.onnx"
     model_path = "YOLOv7 Tiny Level 3 Model/best.onnx"
     input_spec_path = "input_spec.json"
@@ -48,8 +50,12 @@ if __name__ == "__main__":
     inferencer = TileInferencer(model_path, input_spec_path, preprocessing_path)
     with open(postprocessing_path) as f:
         post_cfg = yaml.safe_load(f)
+        
+    nms_processor = NMSProcessor(post_cfg)
     img_tiler = ImageTiler()
     
+    for image_path, file, file_name, format in helper_os_walk(data_path):
+        pass
     
     """
     Input Image Loading
@@ -62,6 +68,7 @@ if __name__ == "__main__":
     img = get_img(img_path)
     all_preds = []
     all_clustered_info = []
+    
     pil_img = Image.fromarray(img)
     draw = ImageDraw.Draw(pil_img)
     
@@ -90,40 +97,54 @@ if __name__ == "__main__":
         boxes, confs, classes = xywh_to_xyxy(preds)
         
         predictions = np.concatenate([boxes, confs[:, None], classes[:, None]], axis=1)
-        nms_processor = NMSProcessor(post_cfg)
-        keep = nms_processor.non_max_suppression(predictions)
-        final_preds = predictions[keep]
-        
         
         """
         Tile-Level Filtering and Suppression
         -----------------------------------
         Raw model predictions are filtered using a confidence threshold,
-        followed by Non-Maximum Suppression (NMS) to remove duplicate detections
+        followed by Non-Maximum Suppression (NMS) / Weighted Boxes Fusion to remove duplicate detections
         within the same tile.
 
         Remaining bounding boxes are reprojected into global image coordinates
         using the tile's top-left offset (x0, y0).
         """
+        
+        """Non-Maximum Suppression (NMS)"""
+        keep = nms_processor.non_max_suppression(predictions)
+        final_preds = predictions[keep]
         final_preds[:, [0, 2]] += x0
         final_preds[:, [1, 3]] += y0
-        
-        """
-        Tile-Level IoU-Based Clustering
-        -------------------------------
-        Within each tile, detections are grouped using an IoU-based graph:
+        try:
+            """Weighted Boxes Fusion"""
+            # boxes, confidences = predictions[:, :4], predictions[:, 4]
+            # new_boxes, new_scores = weighted_boxes_fusion_helper(boxes, confidences, pil_img.size, iou_thr=0.25)
+            # new_label = np.ones((len(new_boxes), 1), dtype=np.int64)
+            # final_preds = np.concatenate([new_boxes, new_scores[:, None], new_label] , axis=1)
+            # final_preds[:, [0, 2]] += x0
+            # final_preds[:, [1, 3]] += y0
+            """
+            Tile-Level IoU-Based Clustering
+            -------------------------------
+            Within each tile, detections are grouped using an IoU-based graph:
 
-        - Each detection is treated as a node
-        - Edges connect detections with non-zero IoU
-        - Connected components represent spatially linked detections
+            - Each detection is treated as a node
+            - Edges connect detections with non-zero IoU
+            - Connected components represent spatially linked detections
 
-        Cluster-level features (bounding box, mean confidence, size)
-        are extracted and stored for later global aggregation.
-        """
-        clustered_info = iou_based_clustering(final_preds[:, :4], final_preds[:, 4])
-        
-        all_preds.append(final_preds)
-        all_clustered_info.extend(clustered_info)
+            Cluster-level features (bounding box, mean confidence, size)
+            are extracted and stored for later global aggregation.
+            """
+            all_preds.append(final_preds)
+            
+            clustered_info = iou_based_clustering(final_preds[:, :4], final_preds[:, 4], pil_img.size)
+            
+            # for info in clustered_info:
+            #     if info['num_boxes'] > 1:
+            #         draw_cluster(draw, info, pil_img.size)
+            
+            all_clustered_info.extend(clustered_info)
+        except:
+            pass
         
     """
     Global Detection Aggregation
@@ -134,11 +155,17 @@ if __name__ == "__main__":
     """
     all_preds = np.vstack(all_preds)
     
-    for box in all_preds:
-        x1, y1, x2, y2, conf, class_id = box
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
-        draw.text((x1, y2), f"{int(class_id)}:{conf:.2f}", fill="red")
-
+    boxes, confidences = all_preds[:, :4], all_preds[:, 4]
+    new_boxes, new_scores = weighted_boxes_fusion_helper(boxes, confidences, pil_img.size, iou_thr=0.25)
+    new_label = np.ones((len(new_boxes), 1), dtype=np.int64)
+    filtered_final_preds = np.concatenate([new_boxes, new_scores[:, None], new_label] , axis=1)
+    
+    
+    for preds in filtered_final_preds:
+        x1, y1, x2, y2, conf, class_id = preds
+        print(preds)
+        draw.rectangle([x1, y1, x2, y2], outline="black", width=1)
+        draw.text((x1, y2), f"{int(class_id)}:{conf:.2f}", fill="black")
     
     """
     Second-Stage (Global) Clustering
@@ -159,7 +186,8 @@ if __name__ == "__main__":
     boxes = np.array(boxes)
     confidences = np.array(confidences)
     
-    infos = iou_based_clustering(boxes, confidences) # boxes, confidences
+    infos = iou_based_clustering(boxes, confidences, pil_img.size)
+    
     
     """
     Visualization (Qualitative Analysis)
@@ -172,10 +200,20 @@ if __name__ == "__main__":
     Visualization is strictly separated from inference logic and
     does not influence computational results.
     """
+    
     for info in infos:
-        if info['num_boxes'] > 1:
-            draw_cluster(draw, info, pil_img.size)
-            
+        thyrocytes_inside_the_cluster = []
+        thyrocytes_inside_the_cluster.extend(get_thyrocytes_inside_cluster(info, filtered_final_preds))
+        for preds in thyrocytes_inside_the_cluster:
+            x1, y1, x2, y2, conf, class_id = preds
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=1)
+            draw.text((x1, y2), f"{conf:.2f}", fill="red")
+        number_of_thyrocytes = len(thyrocytes_inside_the_cluster)
+        if number_of_thyrocytes >= 10:
+            draw_cluster(draw, info, pil_img.size, label=f"Adequate with {len(thyrocytes_inside_the_cluster)} Thyrocytes", color='black')
+        else:
+            draw_cluster(draw, info, pil_img.size, label=f"Inadequate with {len(thyrocytes_inside_the_cluster)} Thyrocytes", color='blue')
+        
     """
     Output Generation
     -----------------

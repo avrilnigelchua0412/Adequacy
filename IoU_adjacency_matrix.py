@@ -17,10 +17,8 @@ A single thyrocyte → many overlapping boxes → dense clique
 Two touching thyrocytes → two cliques connected by a bridge
 Separate cells → disconnected subgraphs
 """
-
-
 import numpy as np
-from nms_processor import NMSProcessor
+from utils import weighted_boxes_fusion_helper, box_iou_batch
 
 def build_iou_graph_batch(boxes):
     """
@@ -28,7 +26,7 @@ def build_iou_graph_batch(boxes):
     returns adjacency list graph
     """
     N = len(boxes)
-    iou_matrix = NMSProcessor.box_iou_batch(boxes, boxes)
+    iou_matrix = box_iou_batch(boxes, boxes)
 
     graph = {i: set() for i in range(N)}
 
@@ -60,20 +58,23 @@ def connected_components(graph):
             components.append(component)
 
     return components
-def cluster_features(boxes, confidences, clusters):
+
+def cluster_features(boxes, confidences, clusters, img_size):
     cluster_info = []
     
     for cluster in clusters:
         cluster_boxes = boxes[cluster]
         cluster_confs = confidences[cluster]
-
-        x1 = np.min(cluster_boxes[:, 0])
-        y1 = np.min(cluster_boxes[:, 1])
-        x2 = np.max(cluster_boxes[:, 2])
-        y2 = np.max(cluster_boxes[:, 3])
+        
+        new_boxes, new_scores = weighted_boxes_fusion_helper(cluster_boxes, cluster_confs, img_size)
+        
+        x1 = np.min(new_boxes[:, 0])
+        y1 = np.min(new_boxes[:, 1])
+        x2 = np.max(new_boxes[:, 2])
+        y2 = np.max(new_boxes[:, 3])
         cluster_info.append({
-            "num_boxes": len(cluster),
-            "mean_confidence": float(np.mean(cluster_confs)),
+            "num_boxes": len(new_boxes),
+            "mean_confidence": float(np.mean(new_scores)),
             "bounding_box": (x1, y1, x2, y2),
             "area": (x2 - x1) * (y2 - y1)
         })
@@ -81,7 +82,7 @@ def cluster_features(boxes, confidences, clusters):
     return cluster_info
 
 @staticmethod
-def iou_based_clustering(boxes, confidences):
+def iou_based_clustering(boxes, confidences, img_size):
     graph = build_iou_graph_batch(boxes)
     clusters = connected_components(graph)
-    return cluster_features(boxes, confidences, clusters)
+    return cluster_features(boxes, confidences, clusters, img_size)
