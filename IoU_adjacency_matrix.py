@@ -76,7 +76,8 @@ def cluster_features(boxes, confidences, clusters, img_size):
             "num_boxes": len(new_boxes),
             "mean_confidence": float(np.mean(new_scores)),
             "bounding_box": (x1, y1, x2, y2),
-            "area": (x2 - x1) * (y2 - y1)
+            "area": (x2 - x1) * (y2 - y1),
+            "boxes": new_boxes
         })
 
     return cluster_info

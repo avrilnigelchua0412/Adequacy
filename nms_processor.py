@@ -5,7 +5,7 @@ import numpy as np
 from utils import box_iou_batch
 class NMSProcessor:
     def __init__(self, postprocessing_cfg):
-        self.conf_thres = postprocessing_cfg["conf_threshold"]
+        # self.conf_thres = postprocessing_cfg["conf_threshold"]
         self.iou_thres = postprocessing_cfg["iou_threshold"]
 
 

@@ -1,4 +1,4 @@
-from utils import xywh_to_xyxy, draw_cluster, get_img, helper_os_walk, weighted_boxes_fusion_helper, get_thyrocytes_inside_cluster
+from utils import xywh_to_xyxy, draw_cluster, get_img, helper_os_walk, weighted_boxes_fusion_helper, get_thyrocytes_inside_cluster, filter_pipeline, draw_thyrocytes_inside_cluster
 from IoU_adjacency_matrix import iou_based_clustering
 from tile_inferencer import TileInferencer
 import onnxruntime as ort
@@ -7,6 +7,7 @@ import numpy as np
 import json, yaml
 from PIL import Image, ImageDraw
 from image_tiler import ImageTiler
+import os
 """
 Tile-Based Object Detection and Clustering Pipeline
 ==================================================
@@ -26,6 +27,84 @@ Intended use:
 - FastAPI backend inference
 - Figure generation for publications
 """
+
+def tile_inference_pipeline(img, pil_img, draw, inferencer, img_tiler, nms_processor, conf_threshold):
+    """
+    Tile-Level Inference Loop
+    ------------------------
+    The input image is decomposed into overlapping tiles.   
+    For each tile:
+    1. The tile is preprocessed and passed through the ONNX model
+    2. Low-confidence predictions are filtered
+    3. Tile-local Non-Maximum Suppression (NMS) is applied
+    4. Bounding boxes are reprojected into global image coordinates
+    5. IoU-based clustering is performed within the tile    
+    Tile-level results are accumulated for global aggregation.
+    """
+    all_preds = []
+    all_clustered_info = []
+    for tile, x0, y0, tile_id in img_tiler.tile(img):
+        preprocessed_img = inferencer.preprocess(tile)
+
+        outputs = inferencer.infer(tile)
+
+        mask = outputs[0][0][:, 4] >= conf_threshold
+        preds = outputs[0][0][mask]     
+        boxes, confs, classes = xywh_to_xyxy(preds)
+
+        predictions = np.concatenate([boxes, confs[:, None], classes[:, None]], axis=1)
+
+        """
+        Tile-Level Filtering and Suppression
+        -----------------------------------
+        Raw model predictions are filtered using a confidence threshold,
+        followed by Non-Maximum Suppression (NMS) to remove duplicate detections
+        within the same tile.
+        """
+
+        """Non-Maximum Suppression (NMS)"""
+        keep = nms_processor.non_max_suppression(predictions)
+        final_preds = predictions[keep]
+
+        if len(final_preds) == 0:
+            continue
+        # Separate boxes and confidences
+        boxes = final_preds[:, :4]
+        confidences = final_preds[:, 4]
+        """1st Filter out boxes with extreme aspect ratios and remove boxes that are fully inside another box"""
+        boxes, confidences = filter_pipeline(boxes, confidences)
+        final_preds = np.c_[boxes, confidences, np.ones((len(boxes), 1))]
+
+        """
+        Remaining bounding boxes are reprojected into global image coordinates
+        using the tile's top-left offset (x0, y0).
+        """
+
+        final_preds[:, [0, 2]] += x0
+        final_preds[:, [1, 3]] += y0
+
+        """
+        Tile-Level IoU-Based Clustering
+        -------------------------------
+        Within each tile, detections are grouped using an IoU-based graph:  
+        - Each detection is treated as a node
+        - Edges connect detections with non-zero IoU
+        - Connected components represent spatially linked detections    
+        Cluster-level features (bounding box, mean confidence, size)
+        are extracted and stored for later global aggregation.
+        """
+        all_preds.append(final_preds)
+
+        clustered_info = iou_based_clustering(final_preds[:, :4], final_preds[:, 4], pil_img.size)
+
+        # """Visualization of tile-level clusters (for debugging)"""
+        # for info in clustered_info:
+        #     if info['num_boxes'] > 1:
+        #         draw_cluster(draw, info, pil_img.size)
+
+        all_clustered_info.extend(clustered_info)
+        
+    return np.vstack(all_preds), all_clustered_info
 
 if __name__ == "__main__":
     data_path = "Data"
@@ -53,171 +132,125 @@ if __name__ == "__main__":
         
     nms_processor = NMSProcessor(post_cfg)
     img_tiler = ImageTiler()
-    
-    for image_path, file, file_name, format in helper_os_walk(data_path):
-        pass
-    
-    """
-    Input Image Loading
-    -------------------
-    The full-resolution image is loaded into memory as a NumPy array.
-    This image serves as the global spatial reference frame for all
-    subsequent detections and clusters.
-    """
-    img_path = "input_tile_image.jpg"
-    img = get_img(img_path)
-    all_preds = []
-    all_clustered_info = []
-    
-    pil_img = Image.fromarray(img)
-    draw = ImageDraw.Draw(pil_img)
-    
-    """
-    Tile-Level Inference Loop
-    ------------------------
-    The input image is decomposed into overlapping tiles.
-
-    For each tile:
-    1. The tile is preprocessed and passed through the ONNX model
-    2. Low-confidence predictions are filtered
-    3. Tile-local Non-Maximum Suppression (NMS) is applied
-    4. Bounding boxes are reprojected into global image coordinates
-    5. IoU-based clustering is performed within the tile
-
-    Tile-level results are accumulated for global aggregation.
-    """
-    for tile, x0, y0, tile_id in img_tiler.tile(img):
-        preprocessed_img = inferencer.preprocess(tile)
-    
-        outputs = inferencer.infer(tile)
+    for conf_threshold in post_cfg["conf_threshold"]:
+        for img_path, file, file_name, format in helper_os_walk(data_path):
         
-        mask = outputs[0][0][:, 4] >= post_cfg['conf_threshold']
-        preds = outputs[0][0][mask] 
-
-        boxes, confs, classes = xywh_to_xyxy(preds)
-        
-        predictions = np.concatenate([boxes, confs[:, None], classes[:, None]], axis=1)
-        
-        """
-        Tile-Level Filtering and Suppression
-        -----------------------------------
-        Raw model predictions are filtered using a confidence threshold,
-        followed by Non-Maximum Suppression (NMS) / Weighted Boxes Fusion to remove duplicate detections
-        within the same tile.
-
-        Remaining bounding boxes are reprojected into global image coordinates
-        using the tile's top-left offset (x0, y0).
-        """
-        
-        """Non-Maximum Suppression (NMS)"""
-        keep = nms_processor.non_max_suppression(predictions)
-        final_preds = predictions[keep]
-        final_preds[:, [0, 2]] += x0
-        final_preds[:, [1, 3]] += y0
-        try:
-            """Weighted Boxes Fusion"""
-            # boxes, confidences = predictions[:, :4], predictions[:, 4]
-            # new_boxes, new_scores = weighted_boxes_fusion_helper(boxes, confidences, pil_img.size, iou_thr=0.25)
-            # new_label = np.ones((len(new_boxes), 1), dtype=np.int64)
-            # final_preds = np.concatenate([new_boxes, new_scores[:, None], new_label] , axis=1)
-            # final_preds[:, [0, 2]] += x0
-            # final_preds[:, [1, 3]] += y0
             """
-            Tile-Level IoU-Based Clustering
-            -------------------------------
-            Within each tile, detections are grouped using an IoU-based graph:
-
-            - Each detection is treated as a node
-            - Edges connect detections with non-zero IoU
-            - Connected components represent spatially linked detections
-
-            Cluster-level features (bounding box, mean confidence, size)
-            are extracted and stored for later global aggregation.
+            Input Image Loading
+            -------------------
+            The full-resolution image is loaded into memory as a NumPy array.
+            This image serves as the global spatial reference frame for all
+            subsequent detections and clusters.
             """
-            all_preds.append(final_preds)
+            img = get_img(img_path)
             
-            clustered_info = iou_based_clustering(final_preds[:, :4], final_preds[:, 4], pil_img.size)
+            pil_img = Image.fromarray(img)
+            draw = ImageDraw.Draw(pil_img)
             
-            # for info in clustered_info:
-            #     if info['num_boxes'] > 1:
-            #         draw_cluster(draw, info, pil_img.size)
+            """Tile-Level Inference"""
+            all_preds, all_clustered_info = tile_inference_pipeline(img, pil_img, draw, inferencer, img_tiler, nms_processor, conf_threshold)
             
-            all_clustered_info.extend(clustered_info)
-        except:
-            pass
-        
-    """
-    Global Detection Aggregation
-    ----------------------------
-    All tile-level detections are concatenated into a single
-    image-level array. At this stage, all bounding boxes share
-    a common global coordinate system.
-    """
-    all_preds = np.vstack(all_preds)
-    
-    boxes, confidences = all_preds[:, :4], all_preds[:, 4]
-    new_boxes, new_scores = weighted_boxes_fusion_helper(boxes, confidences, pil_img.size, iou_thr=0.25)
-    new_label = np.ones((len(new_boxes), 1), dtype=np.int64)
-    filtered_final_preds = np.concatenate([new_boxes, new_scores[:, None], new_label] , axis=1)
-    
-    
-    for preds in filtered_final_preds:
-        x1, y1, x2, y2, conf, class_id = preds
-        print(preds)
-        draw.rectangle([x1, y1, x2, y2], outline="black", width=1)
-        draw.text((x1, y2), f"{int(class_id)}:{conf:.2f}", fill="black")
-    
-    """
-    Second-Stage (Global) Clustering
-    --------------------------------
-    Cluster bounding boxes obtained from individual tiles are
-    clustered again using the same IoU-based graph strategy.
+            """2nd Filter out boxes with extreme aspect ratios and remove boxes that are fully inside another box"""
+            boxes, confidences = filter_pipeline(all_preds[:, :4], all_preds[:, 4])
+            
+            #################################################################################################################################################
+            
+            """
+            Global Detection Aggregation
+            ----------------------------
+            All tile-level detections are concatenated into a single
+            image-level array. At this stage, all bounding boxes share
+            a common global coordinate system.
+            """
+            new_boxes, new_scores = weighted_boxes_fusion_helper(boxes, confidences, pil_img.size, iou_thr=0.25)
+            new_label = np.ones((len(new_boxes), 1), dtype=np.int64)
+            global_final_preds = np.concatenate([new_boxes, new_scores[:, None], new_label] , axis=1)
+            
+            
+            """
+            Second-Stage (Global) Clustering
+            --------------------------------
+            Method 1: 3-Step Clustering
+            
+            Cluster bounding boxes obtained from individual tiles are
+            clustered again using the same IoU-based graph strategy.
+            
+            Method 2: 2-Step Clustering
+            Directly clustering the filtered bounding boxes from the global aggregation step without the intermediate step of clustering tile-level clusters.
+            This approach may yield more biologically relevant clusters by considering the spatial relationships of all detections at once,
+            rather than relying on the potentially noisy intermediate clusters from individual tiles.
+            """
+            
+            #######################################################################################################################################################################
+            #######################################################################################################################################################################
+            #######################################################################################################################################################################
+            # Method 1: 3-Step Clustering
+            # Cluster bounding boxes obtained from individual tiles are clustered again using the same IoU-based graph strategy.
+            #######################################################################################################################################################################
+            
+            # cluster_boxes = []
+            # cluster_confs = []
+            # for cluster in all_clustered_info:
+            #     if cluster["num_boxes"] > 1:
+            #         cluster_boxes.append(cluster["bounding_box"])
+            #         cluster_confs.append(cluster["mean_confidence"])
 
-    This step merges spatially related clusters that span multiple
-    tiles and resolves duplication caused by overlapping tiles.
-    """
-    boxes = []
-    confidences = []
-    for cluster in all_clustered_info:
-        if cluster['num_boxes'] > 1:
-            boxes.append(list(cluster['bounding_box']))
-            confidences.append(cluster['mean_confidence'])
+            # cluster_boxes = np.array(cluster_boxes)
+            # cluster_confs = np.array(cluster_confs)
+            
+            # if len(cluster_boxes) > 0:
+            #     infos = iou_based_clustering(cluster_boxes, cluster_confs, pil_img.size)
+            # else:
+            #     infos = []
+            
+            #######################################################################################################################################################################
+            # Method 2: 2-Step Clustering directly on the filtered bounding boxes from the global aggregation step without the intermediate step of clustering tile-level clusters.
+            #######################################################################################################################################################################
+            if len(new_boxes) > 0:
+                infos = iou_based_clustering(new_boxes, new_scores, pil_img.size)
+            else:
+                infos = []
+            #######################################################################################################################################################################
+            #######################################################################################################################################################################
+            #######################################################################################################################################################################
+            """
+            Visualization (Qualitative Analysis)
+            ------------------------------------
+            For qualitative inspection and debugging:
 
-    boxes = np.array(boxes)
-    confidences = np.array(confidences)
-    
-    infos = iou_based_clustering(boxes, confidences, pil_img.size)
-    
-    
-    """
-    Visualization (Qualitative Analysis)
-    ------------------------------------
-    For qualitative inspection and debugging:
+            - Individual detections are drawn in red
+            - Final cluster bounding boxes are drawn in blue
 
-    - Individual detections are drawn in red
-    - Final cluster bounding boxes are drawn in blue
-
-    Visualization is strictly separated from inference logic and
-    does not influence computational results.
-    """
-    
-    for info in infos:
-        thyrocytes_inside_the_cluster = []
-        thyrocytes_inside_the_cluster.extend(get_thyrocytes_inside_cluster(info, filtered_final_preds))
-        for preds in thyrocytes_inside_the_cluster:
-            x1, y1, x2, y2, conf, class_id = preds
-            draw.rectangle([x1, y1, x2, y2], outline="red", width=1)
-            draw.text((x1, y2), f"{conf:.2f}", fill="red")
-        number_of_thyrocytes = len(thyrocytes_inside_the_cluster)
-        if number_of_thyrocytes >= 10:
-            draw_cluster(draw, info, pil_img.size, label=f"Adequate with {len(thyrocytes_inside_the_cluster)} Thyrocytes", color='black')
-        else:
-            draw_cluster(draw, info, pil_img.size, label=f"Inadequate with {len(thyrocytes_inside_the_cluster)} Thyrocytes", color='blue')
-        
-    """
-    Output Generation
-    -----------------
-    The final visualization image, containing both detections
-    and clustered regions, is saved to disk.
-    """
-    pil_img.save("output_tile_image.jpg")
+            Visualization is strictly separated from inference logic and
+            does not influence computational results.
+            """
+            
+            thyrocytes = [
+                {"bbox": preds[:4].tolist(), "confidence": float(preds[4])}
+                for preds in global_final_preds
+            ]
+            
+            for info in infos:
+                thyrocytes_inside_the_cluster = []
+                thyrocytes_inside_the_cluster.extend(get_thyrocytes_inside_cluster(info, global_final_preds))
+                number_of_thyrocytes = len(thyrocytes_inside_the_cluster)
+                # draw_thyrocytes_inside_cluster(draw, thyrocytes_inside_the_cluster, color="red")
+                if number_of_thyrocytes >= 10:
+                    draw_cluster(draw, info, pil_img.size, label=f"Adequate with {len(thyrocytes_inside_the_cluster)} Thyrocytes", color='red')
+                    draw_thyrocytes_inside_cluster(draw, thyrocytes_inside_the_cluster, color="red")
+                elif number_of_thyrocytes < 10 and number_of_thyrocytes > 1:
+                    draw_cluster(draw, info, pil_img.size, label=f"Inadequate with {len(thyrocytes_inside_the_cluster)} Thyrocytes", color='green')
+                    draw_thyrocytes_inside_cluster(draw, thyrocytes_inside_the_cluster, color="green")
+                else:
+                    draw_thyrocytes_inside_cluster(draw, thyrocytes_inside_the_cluster, color="black")
+                
+            """
+            Output Generation
+            -----------------
+            The final visualization image, containing both detections
+            and clustered regions, is saved to disk.
+            """
+            dir_path = os.path.join("2_step_test_data_for_validation (level 1 - 3)", f'confidence_value: {str(conf_threshold)}', file_name)
+            os.makedirs(dir_path, exist_ok=True)
+            save_path = os.path.join(dir_path, file)
+            pil_img.save(save_path)

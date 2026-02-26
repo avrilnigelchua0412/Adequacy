@@ -64,8 +64,8 @@ def helper_os_walk(file_path):
             format = os.path.splitext(file)[1]
             file_name = os.path.splitext(file)[0]
             if format in formats:
-                image_path = os.path.join(root, file)
-                yield image_path, file, file_name, format
+                img_path = os.path.join(root, file)
+                yield img_path, file, file_name, format
                 
 def normalize_box(box, img_w, img_h):
     x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
@@ -98,17 +98,88 @@ def weighted_boxes_fusion_helper(cluster_boxes, cluster_confs, img_size, iou_thr
     ]
     return np.array(denormalized_boxes), scores
 
-def get_thyrocytes_inside_cluster(cluster_info, filtered_final_preds):
-    cluster_box = np.array(cluster_info["bounding_box"])
+def iqr_filter_aspect_ratio(boxes, confidences, factor=1.5, min_width=10, min_height=10):
+    """
+    Filter bounding boxes that have:
+    1. Outlier aspect ratios using IQR (width / height)
+    2. Very small width or height
+    
+    Returns filtered boxes and confidences.
+    """
+    if len(boxes) == 0:
+        return boxes, confidences
+
+    widths = boxes[:, 2] - boxes[:, 0]
+    heights = boxes[:, 3] - boxes[:, 1]
+
+    # Aspect ratio filtering
+    aspect_ratios = widths / heights
+    Q1 = np.percentile(aspect_ratios, 25)
+    Q3 = np.percentile(aspect_ratios, 75)
+    IQR = Q3 - Q1
+    lower = Q1 - factor * IQR
+    upper = Q3 + factor * IQR
+    mask = (aspect_ratios >= lower) & (aspect_ratios <= upper)
+
+    # Minimum size filtering
+    mask &= (widths >= min_width) & (heights >= min_height)
+
+    return boxes[mask], confidences[mask]
+
+def remove_box_inside_box(boxes, confidences):
+    """
+    Remove bounding boxes that are fully inside another box.
+    """
+    keep = np.ones(len(boxes), dtype=bool)
+
+    for i in range(len(boxes)):
+        for j in range(len(boxes)):
+            if i == j:
+                continue
+
+            xi1, yi1, xi2, yi2 = boxes[i]
+            xj1, yj1, xj2, yj2 = boxes[j]
+
+            if (xi1 >= xj1 and yi1 >= yj1 and
+                xi2 <= xj2 and yi2 <= yj2):
+
+                area_i = (xi2 - xi1) * (yi2 - yi1)
+                area_j = (xj2 - xj1) * (yj2 - yj1)
+
+                if area_i < area_j:
+                    keep[i] = False
+
+    return boxes[keep], confidences[keep]
+
+def filter_pipeline(boxes, confidences):
+    
+    """Filter out boxes with extreme aspect ratios"""
+    boxes, confidences = iqr_filter_aspect_ratio(boxes, confidences)
+    
+    """Remove boxes that are fully inside another box"""
+    boxes, confidences = remove_box_inside_box(boxes, confidences)
+    
+    return boxes, confidences
+
+def get_thyrocytes_inside_cluster(cluster_info, final_preds):
+    boxes = np.array(cluster_info["boxes"])
     thyrocytes_inside_the_cluster = []
-    for preds in filtered_final_preds:
+    for preds in final_preds:
         pred_box = preds[:4]
-        iou = box_iou_batch(
-            pred_box[np.newaxis, :],
-            cluster_box[np.newaxis, :]
-        )[0, 0]
-        if iou  != 0:
-            print("IoU: ", iou)
-            print("Prediction: ", preds)
-            thyrocytes_inside_the_cluster.append(preds)
+        for boxe in boxes:
+            iou = box_iou_batch(
+                pred_box[np.newaxis, :],
+                boxe[np.newaxis, :]
+            )[0, 0]
+            if iou  != 0:
+                print("IoU: ", iou)
+                print("Prediction: ", preds)
+                thyrocytes_inside_the_cluster.append(preds)
+                break  # No need to check other cluster boxes for this prediction
     return thyrocytes_inside_the_cluster
+
+def draw_thyrocytes_inside_cluster(draw, thyrocytes_inside_the_cluster, color):
+    for preds in thyrocytes_inside_the_cluster:
+        x1, y1, x2, y2, conf, class_id = preds
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        draw.text((x1, y2), f"{conf:.2f}", fill=color)
