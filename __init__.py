@@ -1,4 +1,4 @@
-from utils import xywh_to_xyxy, draw_cluster, get_img, helper_os_walk, weighted_boxes_fusion_helper, get_thyrocytes_inside_cluster, filter_pipeline, draw_thyrocytes_inside_cluster
+from utils import process_yolo_preds, draw_cluster, get_img, helper_os_walk, weighted_boxes_fusion_helper, get_thyrocytes_inside_cluster, filter_pipeline_preds, draw_thyrocytes_inside_cluster
 from IoU_adjacency_matrix import iou_based_clustering
 from tile_inferencer import TileInferencer
 import onnxruntime as ort
@@ -8,6 +8,7 @@ import json, yaml
 from PIL import Image, ImageDraw
 from image_tiler import ImageTiler
 import os
+import pandas as pd
 """
 Tile-Based Object Detection and Clustering Pipeline
 ==================================================
@@ -44,14 +45,16 @@ def tile_inference_pipeline(img, pil_img, draw, inferencer, img_tiler, nms_proce
     all_preds = []
     all_clustered_info = []
     for tile, x0, y0, tile_id in img_tiler.tile(img):
-        preprocessed_img = inferencer.preprocess(tile)
+        # preprocessed_img = inferencer.preprocess(tile)
 
         outputs = inferencer.infer(tile)
-
-        mask = outputs[0][0][:, 4] >= conf_threshold
-        preds = outputs[0][0][mask]     
-        boxes, confs, classes = xywh_to_xyxy(preds)
-
+        
+        preds = outputs[0][0]
+        
+        boxes, confs, classes = process_yolo_preds(preds, conf_threshold)
+        
+        # print(classes)
+        
         predictions = np.concatenate([boxes, confs[:, None], classes[:, None]], axis=1)
 
         """
@@ -68,12 +71,22 @@ def tile_inference_pipeline(img, pil_img, draw, inferencer, img_tiler, nms_proce
 
         if len(final_preds) == 0:
             continue
-        # Separate boxes and confidences
-        boxes = final_preds[:, :4]
-        confidences = final_preds[:, 4]
+
         """1st Filter out boxes with extreme aspect ratios and remove boxes that are fully inside another box"""
-        boxes, confidences = filter_pipeline(boxes, confidences)
-        final_preds = np.c_[boxes, confidences, np.ones((len(boxes), 1))]
+        
+        thyrocyte_mask = final_preds[:, 5] == 0
+        thyro_preds = final_preds[thyrocyte_mask]
+
+        # Apply filtering directly on full prediction rows
+        thyro_preds = filter_pipeline_preds(thyro_preds)
+
+        # Combine back with confusants
+        confusant_preds = final_preds[final_preds[:, 5] == 1]
+
+        if len(confusant_preds) > 0:
+            final_preds = np.vstack([thyro_preds, confusant_preds])
+        else:
+            final_preds = thyro_preds
 
         """
         Remaining bounding boxes are reprojected into global image coordinates
@@ -82,7 +95,7 @@ def tile_inference_pipeline(img, pil_img, draw, inferencer, img_tiler, nms_proce
 
         final_preds[:, [0, 2]] += x0
         final_preds[:, [1, 3]] += y0
-
+        
         """
         Tile-Level IoU-Based Clustering
         -------------------------------
@@ -95,22 +108,28 @@ def tile_inference_pipeline(img, pil_img, draw, inferencer, img_tiler, nms_proce
         """
         all_preds.append(final_preds)
 
-        clustered_info = iou_based_clustering(final_preds[:, :4], final_preds[:, 4], pil_img.size)
+        thyro_preds_global = final_preds[final_preds[:, 5] == 0]
+        
+        clustered_info = iou_based_clustering(thyro_preds_global[:, :4], thyro_preds_global[:, 4], pil_img.size)
 
-        # """Visualization of tile-level clusters (for debugging)"""
-        # for info in clustered_info:
-        #     if info['num_boxes'] > 1:
-        #         draw_cluster(draw, info, pil_img.size)
+        """Visualization of tile-level clusters (for debugging)"""
+        for info in clustered_info:
+            if info['num_boxes'] > 1:
+                draw_cluster(draw, info, pil_img.size)
 
         all_clustered_info.extend(clustered_info)
         
     return np.vstack(all_preds), all_clustered_info
 
 if __name__ == "__main__":
-    data_path = "Data"
     
-    # model_path = "YOLOv5 Nano Level 3 Model/best.onnx"
-    model_path = "YOLOv7 Tiny Level 3 Model/best.onnx"
+    test_files = pd.read_csv("test_df_summary.csv")['File'].to_list()
+    
+    data_path = "fnab"
+    
+    # model_path = "fnab_models/YoloV5/modelv2-confusant-level3/weights/best.onnx"
+    model_path = "fnab_models/YoloV7/modelv2-confusant-level3/weights/best.onnx"
+    
     input_spec_path = "input_spec.json"
     preprocessing_path = "preprocessing.yaml"
     postprocessing_path = "postprocessing.yaml"
@@ -132,9 +151,10 @@ if __name__ == "__main__":
         
     nms_processor = NMSProcessor(post_cfg)
     img_tiler = ImageTiler()
-    for conf_threshold in post_cfg["conf_threshold"]:
-        for img_path, file, file_name, format in helper_os_walk(data_path):
-        
+    
+    conf_threshold = post_cfg["conf_threshold"]
+    for img_path, file, file_name, format in helper_os_walk(data_path):
+        if file in test_files: 
             """
             Input Image Loading
             -------------------
@@ -150,8 +170,17 @@ if __name__ == "__main__":
             """Tile-Level Inference"""
             all_preds, all_clustered_info = tile_inference_pipeline(img, pil_img, draw, inferencer, img_tiler, nms_processor, conf_threshold)
             
+            thyrocyte_mask = all_preds[:, 5] == 0
+            thyro_preds = all_preds[thyrocyte_mask]
             """2nd Filter out boxes with extreme aspect ratios and remove boxes that are fully inside another box"""
-            boxes, confidences = filter_pipeline(all_preds[:, :4], all_preds[:, 4])
+            
+            thyro_preds = filter_pipeline_preds(thyro_preds)
+            
+            thyro_boxes = thyro_preds[:, :4]
+            thyro_confs = thyro_preds[:, 4]
+            thyro_classes = thyro_preds[:, 5]
+            
+            
             
             #################################################################################################################################################
             
@@ -162,10 +191,16 @@ if __name__ == "__main__":
             image-level array. At this stage, all bounding boxes share
             a common global coordinate system.
             """
-            new_boxes, new_scores = weighted_boxes_fusion_helper(boxes, confidences, pil_img.size, iou_thr=0.25)
-            new_label = np.ones((len(new_boxes), 1), dtype=np.int64)
-            global_final_preds = np.concatenate([new_boxes, new_scores[:, None], new_label] , axis=1)
+            new_boxes, new_scores = weighted_boxes_fusion_helper(thyro_boxes, thyro_confs, pil_img.size, iou_thr=0.25)
+            thyro_classes = np.zeros(len(new_boxes))
+            thyro_final_preds = np.c_[new_boxes, new_scores, thyro_classes]
             
+            # Combine back with confusants
+            confusant_preds = all_preds[all_preds[:, 5] == 1]
+            if len(confusant_preds) > 0:
+                final_preds = np.vstack([thyro_final_preds, confusant_preds])
+            else:
+                final_preds = thyro_final_preds
             
             """
             Second-Stage (Global) Clustering
@@ -180,7 +215,6 @@ if __name__ == "__main__":
             This approach may yield more biologically relevant clusters by considering the spatial relationships of all detections at once,
             rather than relying on the potentially noisy intermediate clusters from individual tiles.
             """
-            
             #######################################################################################################################################################################
             #######################################################################################################################################################################
             #######################################################################################################################################################################
@@ -188,28 +222,28 @@ if __name__ == "__main__":
             # Cluster bounding boxes obtained from individual tiles are clustered again using the same IoU-based graph strategy.
             #######################################################################################################################################################################
             
-            # cluster_boxes = []
-            # cluster_confs = []
-            # for cluster in all_clustered_info:
-            #     if cluster["num_boxes"] > 1:
-            #         cluster_boxes.append(cluster["bounding_box"])
-            #         cluster_confs.append(cluster["mean_confidence"])
+            cluster_boxes = []
+            cluster_confs = []
+            for cluster in all_clustered_info:
+                if cluster["num_boxes"] > 1:
+                    cluster_boxes.append(cluster["bounding_box"])
+                    cluster_confs.append(cluster["mean_confidence"])
 
-            # cluster_boxes = np.array(cluster_boxes)
-            # cluster_confs = np.array(cluster_confs)
+            cluster_boxes = np.array(cluster_boxes)
+            cluster_confs = np.array(cluster_confs)
             
-            # if len(cluster_boxes) > 0:
-            #     infos = iou_based_clustering(cluster_boxes, cluster_confs, pil_img.size)
-            # else:
-            #     infos = []
+            if len(cluster_boxes) > 0:
+                infos = iou_based_clustering(cluster_boxes, cluster_confs, pil_img.size)
+            else:
+                infos = []
             
             #######################################################################################################################################################################
             # Method 2: 2-Step Clustering directly on the filtered bounding boxes from the global aggregation step without the intermediate step of clustering tile-level clusters.
             #######################################################################################################################################################################
-            if len(new_boxes) > 0:
-                infos = iou_based_clustering(new_boxes, new_scores, pil_img.size)
-            else:
-                infos = []
+            # if len(new_boxes) > 0:
+            #     infos = iou_based_clustering(new_boxes, new_scores, pil_img.size)
+            # else:
+            #     infos = []
             #######################################################################################################################################################################
             #######################################################################################################################################################################
             #######################################################################################################################################################################
@@ -227,12 +261,16 @@ if __name__ == "__main__":
             
             thyrocytes = [
                 {"bbox": preds[:4].tolist(), "confidence": float(preds[4])}
-                for preds in global_final_preds
+                for preds in thyro_final_preds
             ]
             
+            for t in thyrocytes:
+                draw.rectangle(t["bbox"], outline="black", width=3)
+                draw.text((t["bbox"][0], t["bbox"][3]), f"{t['confidence']:.2f}", fill="black")
+                
             for info in infos:
                 thyrocytes_inside_the_cluster = []
-                thyrocytes_inside_the_cluster.extend(get_thyrocytes_inside_cluster(info, global_final_preds))
+                thyrocytes_inside_the_cluster.extend(get_thyrocytes_inside_cluster(info, thyro_final_preds))
                 number_of_thyrocytes = len(thyrocytes_inside_the_cluster)
                 # draw_thyrocytes_inside_cluster(draw, thyrocytes_inside_the_cluster, color="red")
                 if number_of_thyrocytes >= 10:
@@ -250,7 +288,7 @@ if __name__ == "__main__":
             The final visualization image, containing both detections
             and clustered regions, is saved to disk.
             """
-            dir_path = os.path.join("2_step_test_data_for_validation (level 1 - 3)", f'confidence_value: {str(conf_threshold)}', file_name)
+            dir_path = os.path.join("3_step_test_data_for_validation (level 1 - 3)")
             os.makedirs(dir_path, exist_ok=True)
             save_path = os.path.join(dir_path, file)
             pil_img.save(save_path)

@@ -20,23 +20,31 @@ def get_img(tile_img_path):
     tile_img = np.array(Image.open(tile_img_path))  # HWC, RGB
     return tile_img
 
-def xywh_to_xyxy(preds):
-    """
-    preds: np.ndarray of shape (N, 6)
-           [x, y, w, h, conf, class_id]
-    returns:
-        boxes: (N, 4) → [x1, y1, x2, y2]
-        confs: (N,)
-        classes: (N,)
-    """
+def process_yolo_preds(preds, conf_threshold=0.25):
+    # Convert boxes
     xy = preds[:, 0:2]
     wh = preds[:, 2:4]
-
     boxes = np.concatenate([xy - wh / 2, xy + wh / 2], axis=1)
-    confs = preds[:, 4]
-    classes = preds[:, 5].astype(np.int32)
 
-    return boxes, confs, classes
+    # Objectness
+    obj_conf = preds[:, 4]
+
+    # Class probabilities
+    class_probs = preds[:, 5:]
+
+    # Class ID
+    class_ids = np.argmax(class_probs, axis=1)
+
+    # Class score of selected class
+    class_scores = class_probs[np.arange(len(class_probs)), class_ids]
+
+    # Final confidence
+    final_conf = obj_conf * class_scores
+
+    # Filter
+    mask = final_conf >= conf_threshold
+
+    return boxes[mask], final_conf[mask], class_ids[mask]
 
 def draw_cluster(draw, cluster_info, img_size, label="Tile-level-Cluster", color="blue"):
     W, H = img_size
@@ -98,7 +106,7 @@ def weighted_boxes_fusion_helper(cluster_boxes, cluster_confs, img_size, iou_thr
     ]
     return np.array(denormalized_boxes), scores
 
-def iqr_filter_aspect_ratio(boxes, confidences, factor=1.5, min_width=10, min_height=10):
+def iqr_filter_aspect_ratio_preds(preds, factor=1.5, min_width=10, min_height=10):
     """
     Filter bounding boxes that have:
     1. Outlier aspect ratios using IQR (width / height)
@@ -106,30 +114,30 @@ def iqr_filter_aspect_ratio(boxes, confidences, factor=1.5, min_width=10, min_he
     
     Returns filtered boxes and confidences.
     """
-    if len(boxes) == 0:
-        return boxes, confidences
+    boxes = preds[:, :4]
 
     widths = boxes[:, 2] - boxes[:, 0]
     heights = boxes[:, 3] - boxes[:, 1]
 
-    # Aspect ratio filtering
-    aspect_ratios = widths / heights
+    aspect_ratios = widths / (heights + 1e-6)
+    
     Q1 = np.percentile(aspect_ratios, 25)
     Q3 = np.percentile(aspect_ratios, 75)
     IQR = Q3 - Q1
     lower = Q1 - factor * IQR
     upper = Q3 + factor * IQR
+    
     mask = (aspect_ratios >= lower) & (aspect_ratios <= upper)
-
-    # Minimum size filtering
     mask &= (widths >= min_width) & (heights >= min_height)
 
-    return boxes[mask], confidences[mask]
 
-def remove_box_inside_box(boxes, confidences):
+    return preds[mask]
+
+def remove_box_inside_box_preds(preds):
     """
     Remove bounding boxes that are fully inside another box.
     """
+    boxes = preds[:, :4]
     keep = np.ones(len(boxes), dtype=bool)
 
     for i in range(len(boxes)):
@@ -148,18 +156,20 @@ def remove_box_inside_box(boxes, confidences):
 
                 if area_i < area_j:
                     keep[i] = False
+                    
+    return preds[keep]
 
-    return boxes[keep], confidences[keep]
+def filter_pipeline_preds(preds):
+    """
+    preds: (N, 6) → [x1, y1, x2, y2, conf, class]
+    """
+    if len(preds) == 0:
+        return preds
 
-def filter_pipeline(boxes, confidences):
-    
-    """Filter out boxes with extreme aspect ratios"""
-    boxes, confidences = iqr_filter_aspect_ratio(boxes, confidences)
-    
-    """Remove boxes that are fully inside another box"""
-    boxes, confidences = remove_box_inside_box(boxes, confidences)
-    
-    return boxes, confidences
+    preds = iqr_filter_aspect_ratio_preds(preds)
+    preds = remove_box_inside_box_preds(preds)
+
+    return preds
 
 def get_thyrocytes_inside_cluster(cluster_info, final_preds):
     boxes = np.array(cluster_info["boxes"])
@@ -172,8 +182,8 @@ def get_thyrocytes_inside_cluster(cluster_info, final_preds):
                 boxe[np.newaxis, :]
             )[0, 0]
             if iou  != 0:
-                print("IoU: ", iou)
-                print("Prediction: ", preds)
+                # print("IoU: ", iou)
+                # print("Prediction: ", preds)
                 thyrocytes_inside_the_cluster.append(preds)
                 break  # No need to check other cluster boxes for this prediction
     return thyrocytes_inside_the_cluster

@@ -66,18 +66,18 @@ def cluster_features(boxes, confidences, clusters, img_size):
         cluster_boxes = boxes[cluster]
         cluster_confs = confidences[cluster]
         
-        new_boxes, new_scores = weighted_boxes_fusion_helper(cluster_boxes, cluster_confs, img_size)
+        # new_boxes, new_scores = weighted_boxes_fusion_helper(cluster_boxes, cluster_confs, img_size)
         
-        x1 = np.min(new_boxes[:, 0])
-        y1 = np.min(new_boxes[:, 1])
-        x2 = np.max(new_boxes[:, 2])
-        y2 = np.max(new_boxes[:, 3])
+        x1 = np.min(cluster_boxes[:, 0])
+        y1 = np.min(cluster_boxes[:, 1])
+        x2 = np.max(cluster_boxes[:, 2])
+        y2 = np.max(cluster_boxes[:, 3])
         cluster_info.append({
-            "num_boxes": len(new_boxes),
-            "mean_confidence": float(np.mean(new_scores)),
+            "num_boxes": len(cluster_boxes),
+            "mean_confidence": float(np.mean(cluster_confs)),
             "bounding_box": (x1, y1, x2, y2),
             "area": (x2 - x1) * (y2 - y1),
-            "boxes": new_boxes
+            "boxes": cluster_boxes
         })
 
     return cluster_info
