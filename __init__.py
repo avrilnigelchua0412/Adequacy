@@ -199,6 +199,11 @@ if __name__ == "__main__":
             confusant_preds = all_preds[all_preds[:, 5] == 1]
             if len(confusant_preds) > 0:
                 final_preds = np.vstack([thyro_final_preds, confusant_preds])
+                for preds in confusant_preds:
+                    bbox = preds[:4].tolist()
+                    confidence = float(preds[4])
+                    draw.rectangle(bbox, outline="yellow", width=3)
+                    draw.text((bbox[0], bbox[3]), f"{confidence:.2f}", fill="yellow")
             else:
                 final_preds = thyro_final_preds
             
@@ -222,28 +227,28 @@ if __name__ == "__main__":
             # Cluster bounding boxes obtained from individual tiles are clustered again using the same IoU-based graph strategy.
             #######################################################################################################################################################################
             
-            cluster_boxes = []
-            cluster_confs = []
-            for cluster in all_clustered_info:
-                if cluster["num_boxes"] > 1:
-                    cluster_boxes.append(cluster["bounding_box"])
-                    cluster_confs.append(cluster["mean_confidence"])
+            # cluster_boxes = []
+            # cluster_confs = []
+            # for cluster in all_clustered_info:
+            #     if cluster["num_boxes"] > 1:
+            #         cluster_boxes.append(cluster["bounding_box"])
+            #         cluster_confs.append(cluster["mean_confidence"])
 
-            cluster_boxes = np.array(cluster_boxes)
-            cluster_confs = np.array(cluster_confs)
+            # cluster_boxes = np.array(cluster_boxes)
+            # cluster_confs = np.array(cluster_confs)
             
-            if len(cluster_boxes) > 0:
-                infos = iou_based_clustering(cluster_boxes, cluster_confs, pil_img.size)
-            else:
-                infos = []
+            # if len(cluster_boxes) > 0:
+            #     infos = iou_based_clustering(cluster_boxes, cluster_confs, pil_img.size)
+            # else:
+            #     infos = []
             
             #######################################################################################################################################################################
             # Method 2: 2-Step Clustering directly on the filtered bounding boxes from the global aggregation step without the intermediate step of clustering tile-level clusters.
             #######################################################################################################################################################################
-            # if len(new_boxes) > 0:
-            #     infos = iou_based_clustering(new_boxes, new_scores, pil_img.size)
-            # else:
-            #     infos = []
+            if len(new_boxes) > 0:
+                infos = iou_based_clustering(new_boxes, new_scores, pil_img.size)
+            else:
+                infos = []
             #######################################################################################################################################################################
             #######################################################################################################################################################################
             #######################################################################################################################################################################
@@ -259,14 +264,11 @@ if __name__ == "__main__":
             does not influence computational results.
             """
             
-            thyrocytes = [
-                {"bbox": preds[:4].tolist(), "confidence": float(preds[4])}
-                for preds in thyro_final_preds
-            ]
-            
-            for t in thyrocytes:
-                draw.rectangle(t["bbox"], outline="black", width=3)
-                draw.text((t["bbox"][0], t["bbox"][3]), f"{t['confidence']:.2f}", fill="black")
+            for preds in thyro_final_preds:
+                bbox = preds[:4].tolist()
+                confidence = float(preds[4])
+                draw.rectangle(bbox, outline="black", width=3)
+                draw.text((bbox[0], bbox[3]), f"{confidence:.2f}", fill="black")
                 
             for info in infos:
                 thyrocytes_inside_the_cluster = []
@@ -288,7 +290,7 @@ if __name__ == "__main__":
             The final visualization image, containing both detections
             and clustered regions, is saved to disk.
             """
-            dir_path = os.path.join("3_step_test_data_for_validation (level 1 - 3)")
+            dir_path = os.path.join("2_step_test_data_for_validation (level 1 - 3)")
             os.makedirs(dir_path, exist_ok=True)
             save_path = os.path.join(dir_path, file)
             pil_img.save(save_path)
